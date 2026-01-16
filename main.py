@@ -2,7 +2,7 @@ import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from pyrogram.errors import UserNotParticipant
-import psycopg2
+import sqlite3
 from aiohttp import web
 import os
 import sys
@@ -14,7 +14,6 @@ try:
     API_ID = int(os.environ.get("API_ID"))
     API_HASH = os.environ.get("API_HASH")
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
-    DATABASE_URL = os.environ.get("DATABASE_URL") # Supabase wala link
     OWNER_ID = int(os.environ.get("OWNER_ID"))
     LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
     FORCE_CHANNEL = os.environ.get("FORCE_CHANNEL")
@@ -24,52 +23,47 @@ except:
     sys.exit(1)
 
 # ==========================================
-# 🔌 DATABASE CONNECTION (PostgreSQL)
+# 📂 INTERNAL DATABASE (NO INTERNET NEEDED)
 # ==========================================
-print("🔄 Connecting to Supabase...")
-try:
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.autocommit = True
-    cur = conn.cursor()
-    
-    # 🛠️ AUTO CREATE TABLES (Agar nahi hai to bana dega)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            points INT DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS videos (
-            id SERIAL PRIMARY KEY,
-            file_id TEXT UNIQUE
-        );
-    """)
-    print("✅ Database Connected & Tables Ready!")
-except Exception as e:
-    print(f"❌ Database Error: {e}")
-    sys.exit(1)
+print("🔄 Opening Internal Database...")
+conn = sqlite3.connect('mybot.db', check_same_thread=False)
+cur = conn.cursor()
+
+# Table banao agar nahi hai
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        points INTEGER DEFAULT 0
+    )
+""")
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS videos (
+        file_id TEXT PRIMARY KEY
+    )
+""")
+conn.commit()
+print("✅ Internal Database Ready! (No Network Issues)")
 
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # --- DATABASE FUNCTIONS ---
 def get_points(uid):
-    cur.execute("SELECT points FROM users WHERE user_id = %s", (uid,))
+    cur.execute("SELECT points FROM users WHERE user_id = ?", (uid,))
     result = cur.fetchone()
     return result[0] if result else 0
 
 def add_points(uid, amt):
-    # Upsert Logic (Insert agar naya hai, Update agar purana hai)
-    cur.execute("""
-        INSERT INTO users (user_id, points) VALUES (%s, %s)
-        ON CONFLICT (user_id) DO UPDATE SET points = users.points + %s
-    """, (uid, amt, amt))
+    cur.execute("INSERT OR IGNORE INTO users (user_id, points) VALUES (?, 0)", (uid,))
+    cur.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (amt, uid))
+    conn.commit()
 
 def save_video_db(file_id):
     try:
-        cur.execute("INSERT INTO videos (file_id) VALUES (%s) ON CONFLICT DO NOTHING", (file_id,))
+        cur.execute("INSERT OR IGNORE INTO videos (file_id) VALUES (?)", (file_id,))
+        conn.commit()
     except: pass
 
 def get_random_video():
-    # SQL Command random row nikalne ke liye
     cur.execute("SELECT file_id FROM videos ORDER BY RANDOM() LIMIT 1")
     res = cur.fetchone()
     return res[0] if res else None
@@ -90,7 +84,7 @@ async def start(bot, msg):
         except: pass
 
     # New User Check
-    cur.execute("SELECT 1 FROM users WHERE user_id = %s", (uid,))
+    cur.execute("SELECT 1 FROM users WHERE user_id = ?", (uid,))
     if not cur.fetchone():
         add_points(uid, 50) # Welcome Bonus
         # Refer System
@@ -150,7 +144,7 @@ async def web_server():
 async def main():
     await web_server()
     await app.start()
-    print("✅ Bot Started!")
+    print("✅ Bot Started with INTERNAL DB!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
