@@ -2,74 +2,111 @@ import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from pyrogram.errors import UserNotParticipant
-import redis
+import psycopg2
 from aiohttp import web
 import os
 import sys
 
-# --- VARIABLES (Server se uthayega) ---
+# ==========================================
+# 👇 SETTINGS (Server se lega)
+# ==========================================
 try:
     API_ID = int(os.environ.get("API_ID"))
     API_HASH = os.environ.get("API_HASH")
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
-    REDIS_URL = os.environ.get("REDIS_URL")
+    DATABASE_URL = os.environ.get("DATABASE_URL") # Supabase wala link
     OWNER_ID = int(os.environ.get("OWNER_ID"))
     LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
-    FORCE_CHANNEL = os.environ.get("FORCE_CHANNEL") # Bina @ ke username
-    PORT = int(os.environ.get("PORT", "8080"))
-except Exception as e:
-    print(f"❌ Configuration Error: {e}")
+    FORCE_CHANNEL = os.environ.get("FORCE_CHANNEL")
+    PORT = int(os.environ.get("PORT", 8080))
+except:
+    print("❌ Variables Missing! Render Settings check karo.")
     sys.exit(1)
 
-# --- SETUP ---
-print("✅ Connecting to Database...")
-db = redis.from_url(REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
+# ==========================================
+# 🔌 DATABASE CONNECTION (PostgreSQL)
+# ==========================================
+print("🔄 Connecting to Supabase...")
+try:
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True
+    cur = conn.cursor()
+    
+    # 🛠️ AUTO CREATE TABLES (Agar nahi hai to bana dega)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            points INT DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS videos (
+            id SERIAL PRIMARY KEY,
+            file_id TEXT UNIQUE
+        );
+    """)
+    print("✅ Database Connected & Tables Ready!")
+except Exception as e:
+    print(f"❌ Database Error: {e}")
+    sys.exit(1)
+
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- FUNCTIONS ---
+# --- DATABASE FUNCTIONS ---
 def get_points(uid):
-    p = db.get(f"user:{uid}:points")
-    return int(p) if p else 0
+    cur.execute("SELECT points FROM users WHERE user_id = %s", (uid,))
+    result = cur.fetchone()
+    return result[0] if result else 0
 
 def add_points(uid, amt):
-    db.incrby(f"user:{uid}:points", amt)
+    # Upsert Logic (Insert agar naya hai, Update agar purana hai)
+    cur.execute("""
+        INSERT INTO users (user_id, points) VALUES (%s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET points = users.points + %s
+    """, (uid, amt, amt))
 
-# --- START ---
+def save_video_db(file_id):
+    try:
+        cur.execute("INSERT INTO videos (file_id) VALUES (%s) ON CONFLICT DO NOTHING", (file_id,))
+    except: pass
+
+def get_random_video():
+    # SQL Command random row nikalne ke liye
+    cur.execute("SELECT file_id FROM videos ORDER BY RANDOM() LIMIT 1")
+    res = cur.fetchone()
+    return res[0] if res else None
+
+# --- BOT LOGIC ---
 @app.on_message(filters.command("start"))
 async def start(bot, msg):
     uid = msg.from_user.id
-    
-    # Force Sub Check
-    if FORCE_CHANNEL:
+
+    # Force Sub
+    if FORCE_CHANNEL and FORCE_CHANNEL.lower() != "none":
         try:
             await bot.get_chat_member(FORCE_CHANNEL, uid)
         except UserNotParticipant:
             btn = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{FORCE_CHANNEL}")]])
-            await msg.reply(f"⚠️ **Access Denied!**\n\nPlease join our channel first.", reply_markup=btn)
+            await msg.reply("🚫 **Access Denied!**\nJoin channel first.", reply_markup=btn)
             return
-        except Exception:
-            pass # Admin or Error
+        except: pass
 
-    # New User Logic
-    if not db.exists(f"user:{uid}:points"):
-        db.set(f"user:{uid}:points", 50) # Bonus 50
-        # Refer Check
+    # New User Check
+    cur.execute("SELECT 1 FROM users WHERE user_id = %s", (uid,))
+    if not cur.fetchone():
+        add_points(uid, 50) # Welcome Bonus
+        # Refer System
         if len(msg.command) > 1 and msg.command[1].isdigit():
-            ref_id = int(msg.command[1])
-            if ref_id != uid:
-                add_points(ref_id, 50) # Refer Bonus
-                try: await bot.send_message(ref_id, "🎉 New Referral! +50 Points")
+            ref = int(msg.command[1])
+            if ref != uid:
+                add_points(ref, 20)
+                try: await bot.send_message(ref, "🎉 New Referral! +20 Points")
                 except: pass
-
-    # Menu
+    
     menu = ReplyKeyboardMarkup([
         [KeyboardButton("VIDEO 🎬"), KeyboardButton("POINTS 🥇")],
         [KeyboardButton("PROFILE 👤"), KeyboardButton("REFER 🔗")]
     ], resize_keyboard=True)
-    
     await msg.reply(f"👋 Welcome **{msg.from_user.first_name}**!", reply_markup=menu)
 
-# --- FEATURES ---
 @app.on_message(filters.regex("POINTS 🥇"))
 async def pts(bot, m):
     await m.reply(f"🥇 Points: **{get_points(m.from_user.id)}**")
@@ -77,28 +114,27 @@ async def pts(bot, m):
 @app.on_message(filters.regex("PROFILE 👤"))
 async def prof(bot, m):
     uid = m.from_user.id
-    await m.reply(f"👤 **PROFILE**\n🆔 `{uid}`\n💰 Points: {get_points(uid)}")
+    await m.reply(f"👤 **PROFILE**\n🆔 `{uid}`\n💰 Balance: {get_points(uid)}")
 
 @app.on_message(filters.regex("REFER 🔗"))
 async def refer(bot, m):
     link = f"https://t.me/{bot.me.username}?start={m.from_user.id}"
-    await m.reply(f"🔗 **Refer Link:**\n`{link}`\n\nInvite & Earn 50 Points!")
+    await m.reply(f"🔗 **Refer Link:**\n`{link}`\n\nReward: +20 Points")
 
-# --- VIDEO LOGIC ---
 @app.on_message(filters.chat(LOG_CHANNEL) & filters.video)
-async def save_vid(bot, m):
-    db.sadd("videos", m.video.file_id)
+async def saver(bot, m):
+    save_video_db(m.video.file_id)
 
 @app.on_message(filters.regex("VIDEO 🎬"))
 async def get_vid(bot, m):
     uid = m.from_user.id
     if get_points(uid) >= 5:
-        vid = db.srandmember("videos")
+        vid = get_random_video()
         if vid:
             add_points(uid, -5)
             await m.reply_video(vid, caption="✅ Points: -5")
         else:
-            await m.reply("❌ No videos in DB!")
+            await m.reply("❌ No videos in Database!")
     else:
         await m.reply("❌ Low Balance! Need 5 Points.")
 
