@@ -1,5 +1,5 @@
 pyrogram
 tgcrypto
-redis
+psycopg2-binary
 dnspython
 aiohttp
